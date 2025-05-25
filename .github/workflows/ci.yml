@@ -1,89 +1,78 @@
-name: Test and Validate
+name: Release
 
 on:
   push:
-    branches: [ master ]
-  pull_request:
+    tags:
+    - 'v*.*.*'
   workflow_dispatch:
 
 jobs:
-  build-test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        toolchain: [stable, nightly]
-        profile: [dev, release]
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            target: x86_64-apple-darwin
-
-    name: Build & Test (${{ matrix.os }} - ${{ matrix.target }}, ${{ matrix.toolchain }}, ${{ matrix.profile }})
+  build-windows: # 新增的 job
     runs-on: ${{ matrix.os }}
-
-    env:
-      RA_TARGET: ${{ matrix.target }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: ${{ matrix.toolchain }}
-          target: ${{ matrix.target }}
-          profile: minimal
-          override: true
-
-      - name: Install Rust library source
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: ${{ matrix.toolchain }}
-          target: ${{ matrix.target }}
-          profile: minimal
-          override: true
-          components: rust-src
-
-      - name: Build
-        run: cargo build --verbose --target ${{ matrix.target }} --profile ${{ matrix.profile }}
-
-      - name: Run tests
-        run: cargo test --verbose --target ${{ matrix.target }} --profile ${{ matrix.profile }}
-
-  lint:
+    permissions:
+      contents: write
     strategy:
-      fail-fast: false
       matrix:
-        os: [ubuntu-latest]
-        profile: [dev, release]
-
-    name: Formatter (${{ matrix.os }}, ${{ matrix.toolchain }}, ${{ matrix.profile }})
-
-    needs: build-test
-
-    runs-on: ubuntu-latest
-
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: i686-pc-windows-msvc # 如果需要 32 位 Windows 版本
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - name: Read release tag
+      run: |
+        # 使用 PowerShell 语法来设置环境变量
+        if ("${{ github.event_name }}" -eq 'workflow_dispatch') {
+            echo "RELEASE_TAG=master" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        } else {
+            $tag = "${{ github.ref }}".Replace("refs/tags/", "")
+            echo "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        }
 
-      - name: Install Rust components
-        run: |
-          rustup toolchain install nightly --profile minimal
-          rustup component add rustfmt --toolchain nightly
-          rustup component add clippy
+    - name: Checkout
+      uses: actions/checkout@v4
 
-      - name: Check formatting
-        run: cargo +nightly fmt --all -- --check
+    - name: Fetch tags
+      run: |
+        git fetch --tags -f
 
-      - name: Check code for possible improvements (dev profile)
-        if: matrix.profile == 'dev'
-        run: cargo clippy -- -D warnings
+    - name: Add Rust target
+      run: |
+        rustup target add ${{ matrix.target }}
 
-      - name: Check code for possible improvements (release profile)
-        if: matrix.profile == 'release'
-        run: cargo clippy --release -- -D warnings
+    - name: Build release
+      run: |
+        cargo build --release --target ${{ matrix.target }}
+
+    - name: Copy artifacts
+      # 在 Windows 上，路径和命令有所不同
+      working-directory: ./target
+      run: |
+        # 创建一个临时目录来存放要压缩的文件
+        New-Item -ItemType Directory -Force -Path ".\artifacts_temp"
+
+        # 复制主可执行文件
+        Copy-Item -Path "${{ matrix.target }}\release\rmpc.exe" -Destination ".\artifacts_temp\"
+
+        # 如果你的 'man' 和 'completions' 目录在项目根目录，需要调整路径
+        # 这里假设它们是在项目根目录
+        if (Test-Path "$env:GITHUB_WORKSPACE\man") {
+            Copy-Item -Path "$env:GITHUB_WORKSPACE\man" -Destination ".\artifacts_temp\" -Recurse
+        }
+        if (Test-Path "$env:GITHUB_WORKSPACE\completions") {
+            Copy-Item -Path "$env:GITHUB_WORKSPACE\completions" -Destination ".\artifacts_temp\" -Recurse
+        }
+
+        # 创建一个用于最终发布产物的目录
+        New-Item -ItemType Directory -Force -Path "C:\artifacts"
+        
+        # 使用 7-Zip 创建 zip 压缩包
+        # 7-Zip 是 GitHub Actions Windows runner 默认安装的工具
+        7z a "C:\artifacts\rmpc-$env:RELEASE_TAG-${{ matrix.target }}.zip" ".\artifacts_temp\*"
+
+    - name: Release
+      uses: ncipollo/release-action@v1
+      with:
+        allowUpdates: true
+        draft: true
+        artifacts: C:/artifacts/* # Windows 路径
